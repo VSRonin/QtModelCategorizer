@@ -138,6 +138,8 @@ class CategorizerPrivate{
     void removeFromMapping(TreeRow* item);
     void onSourceDataChanged(const QModelIndex& topLeft, const QModelIndex& bottomRight, const QVector<int>& roles);
     void onSourceRowsInserted(const QModelIndex &parent, int first, int last);
+    void onSourceColumnsInserted(const QModelIndex &parent, int first, int last);
+    void onSourceColumnsAboutToBeInserted(const QModelIndex &parent, int first, int last);
     enum {RootDataRole = Qt::UserRole};
 };
 
@@ -325,8 +327,20 @@ void CategorizerPrivate::onSourceRowsInserted(const QModelIndex &parent, int fir
             else {
                 catParent = m_treeStructure.at(mappingIndex);
             }
-            q->beginInsertRows(indexForItem(catParent, 0), catParent->children().size(), catParent->children().size());
+            const int catChildSize = catParent->children().size();
+            int insertIndex = catChildSize;
+            for (int j = 0; j < catChildSize;++j){
+                const QList<QPersistentModelIndex>& columnList = catParent->children().at(j)->columns();
+                Q_ASSERT(!columnList.isEmpty());
+                if (columnList.first().row() >= i) {
+                    insertIndex = j;
+                    break;
+                }
+            }
+            q->beginInsertRows(indexForItem(catParent, 0), insertIndex, insertIndex);
             TreeRow* const currItm = new TreeRow(catParent, 0);
+            if (insertIndex != catChildSize)
+                catParent->children().move(catChildSize, insertIndex);
             for (int j = 0; j < colCnt; ++j) {
                 const QPersistentModelIndex currIdx = q->sourceModel()->index(i, j);
                 m_mapping.insert(currIdx, currItm);
@@ -355,6 +369,42 @@ void CategorizerPrivate::onSourceRowsInserted(const QModelIndex &parent, int fir
         }
         q->endInsertRows();
     }
+}
+void CategorizerPrivate::onSourceColumnsAboutToBeInserted(const QModelIndex &parent, int first, int last){
+    Q_Q(Categorizer);
+    if(!parent.isValid())
+        q->beginInsertColumns(QModelIndex(), first, last);
+}
+void CategorizerPrivate::onSourceColumnsInserted(const QModelIndex &parent, int first, int last)
+{
+    Q_Q(Categorizer);
+    if(parent.isValid()){
+        const QModelIndex proxyParent = q->mapFromSource(parent);
+        TreeRow* const parentItem = itemForIndex(proxyParent);
+        Q_ASSERT(parentItem);
+        const int childSize = parentItem->children().size();
+        q->beginInsertColumns(proxyParent, first, last);
+        for (int i = 0; i < childSize; ++i) {
+            for (int j = first; j <= last;++j){
+                parentItem->children().at(i)->columns().insert(j, q->sourceModel()->index(i, j, parent));
+            }
+        }
+        q->endInsertColumns();
+    }
+    else {
+        // #TODO
+        const int catSize = m_treeStructure.size();
+        q->endInsertColumns(); // started in onSourceColumnsAboutToBeInserted
+        // insert within categories
+        for (int catIter = 0; catIter < catSize; ++catIter) {
+            const QModelIndex catParent = q->index(catIter, 0);
+            q->beginInsertColumns(catParent, first, last);
+            for (int j = first; j <= last; ++j) {
+                m_treeStructure.at(catIter)->columns().insert(j, q->sourceModel()->index(catIter, j, parent));
+            }
+            q->endInsertColumns();
+        }
+    }    
 }
 
 void CategorizerPrivate::rebuildTreeStructure(const QModelIndex &sourceParent, TreeRow* currParent, int parentCol)
@@ -431,14 +481,24 @@ void CategorizerPrivate::onSourceDataChanged(const QModelIndex& topLeft, const Q
         else {
             destinationCat = m_treeStructure.at(destinationRow);
         }
-        q->beginMoveRows(proxyIdx.parent(), proxyIdx.row(), proxyIdx.row(), q->index(destinationRow, 0), destinationCat->children().size());
+        const int catChildSize = destinationCat->children().size();
+        int insertIndex = catChildSize;
+        for (int j = 0; j < catChildSize; ++j) {
+            const QList<QPersistentModelIndex>& columnList = destinationCat->children().at(j)->columns();
+            Q_ASSERT(!columnList.isEmpty());
+            if (columnList.first().row() >= i) {
+                insertIndex = j;
+                break;
+            }
+        }
+        q->beginMoveRows(proxyIdx.parent(), proxyIdx.row(), proxyIdx.row(), q->index(destinationRow, 0), insertIndex);
         TreeRow* const proxyItem = itemForIndex(proxyIdx);
         TreeRow* const oldParentItem = proxyItem->parent();
         Q_ASSERT(oldParentItem);
         Q_ASSERT(!oldParentItem->parent());
         oldParentItem->children().removeAll(proxyItem);
         proxyItem->setParent(destinationCat);
-        destinationCat->children().append(proxyItem);
+        destinationCat->children().insert(insertIndex,proxyItem);
         q->endMoveRows();
         if(oldParentItem->children().isEmpty()){
             q->beginRemoveRows(QModelIndex(), catRow, catRow);
@@ -478,6 +538,8 @@ void Categorizer::setSourceModel(QAbstractItemModel* newSourceModel)
         d->m_sourceConnections << QObject::connect(sourceModel(), &QAbstractItemModel::modelReset, this, std::bind(&CategorizerPrivate::rebuildMapping, d));
         d->m_sourceConnections << QObject::connect(sourceModel(), &QAbstractItemModel::dataChanged, this, std::bind(&CategorizerPrivate::onSourceDataChanged, d, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
         d->m_sourceConnections << QObject::connect(sourceModel(), &QAbstractItemModel::rowsInserted, this, std::bind(&CategorizerPrivate::onSourceRowsInserted, d, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+        d->m_sourceConnections << QObject::connect(sourceModel(), &QAbstractItemModel::columnsInserted, this, std::bind(&CategorizerPrivate::onSourceColumnsInserted, d, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+        d->m_sourceConnections << QObject::connect(sourceModel(), &QAbstractItemModel::columnsAboutToBeInserted, this, std::bind(&CategorizerPrivate::onSourceColumnsAboutToBeInserted, d, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
         d->m_sourceConnections << QObject::connect(sourceModel(), &QAbstractItemModel::dataChanged, this, [this](const QModelIndex& topLeft, const QModelIndex& bottomRight, const QVector<int>& roles) {
             dataChanged(mapFromSource(topLeft), mapFromSource(bottomRight), roles);
         });

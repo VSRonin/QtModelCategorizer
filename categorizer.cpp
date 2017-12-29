@@ -140,6 +140,8 @@ class CategorizerPrivate{
     void onSourceRowsInserted(const QModelIndex &parent, int first, int last);
     void onSourceColumnsInserted(const QModelIndex &parent, int first, int last);
     void onSourceColumnsAboutToBeInserted(const QModelIndex &parent, int first, int last);
+    void onSourceRowsAboutToBeRemoved(const QModelIndex &parent, int first, int last);
+    void onSourceRowsRemoved(const QModelIndex &parent, int first, int last);
     enum {RootDataRole = Qt::UserRole};
 };
 
@@ -171,7 +173,18 @@ bool Categorizer::removeRows(int row, int count, const QModelIndex &parent)
     if (!parent.isValid() || !sourceModel() || row<0 || count <= 0)
         return false;
     Q_ASSERT(parent.model() == this);
+    if (parent.parent().isValid())
+        return sourceModel()->removeRows(row, count, mapToSource(parent));
     Q_D(Categorizer);
+    const TreeRow* const parentItem = d->itemForIndex(parent);
+    if (row >= parentItem->children().size())
+        return false;
+    const QList<QPersistentModelIndex>& childCols = parentItem->children().at(row)->columns();
+    Q_ASSERT(!childCols.isEmpty());
+    return sourceModel()->removeRows(childCols.first().row(), count, QModelIndex());
+/*
+
+
     TreeRow* const parentItem = d->itemForIndex(parent);
     if (row + count - 1 >= parentItem->children().size())
         return false;
@@ -206,7 +219,7 @@ bool Categorizer::removeRows(int row, int count, const QModelIndex &parent)
         }
         endRemoveRows();
     }
-    return result;
+    return result;*/
 }
 
 bool Categorizer::moveRows(const QModelIndex &sourceParent, int sourceRow, int count, const QModelIndex &destinationParent, int destinationChild) 
@@ -278,32 +291,32 @@ void CategorizerPrivate::rebuildMapping()
     Q_Q(Categorizer);
     m_mapping.clear();
     clearTreeStructure();
-    if (!q->sourceModel())
-        return;
     q->beginResetModel();
-    const int rowCnt = q->sourceModel()->rowCount();
-    const int colCnt = q->sourceModel()->columnCount();
-    for (int i = 0; i < rowCnt; ++i) {
-        const QVariant idxData = q->sourceModel()->index(i, m_keyColumn).data(m_keyRole);
-        const int mappingIndex = indexForKey(idxData);
-        TreeRow* catParent = Q_NULLPTR;
-        if (mappingIndex < 0) {
-            catParent = new TreeRow(Q_NULLPTR, 0);
-            catParent->setCategory(idxData);
-            m_treeStructure.append(catParent);
+    if (q->sourceModel()) {
+        const int rowCnt = q->sourceModel()->rowCount();
+        const int colCnt = q->sourceModel()->columnCount();
+        for (int i = 0; i < rowCnt; ++i) {
+            const QVariant idxData = q->sourceModel()->index(i, m_keyColumn).data(m_keyRole);
+            const int mappingIndex = indexForKey(idxData);
+            TreeRow* catParent = Q_NULLPTR;
+            if (mappingIndex < 0) {
+                catParent = new TreeRow(Q_NULLPTR, 0);
+                catParent->setCategory(idxData);
+                m_treeStructure.append(catParent);
+            }
+            else {
+                catParent = m_treeStructure.at(mappingIndex);
+            }
+            TreeRow* const currItm = new TreeRow(catParent, 0);
+            for (int j = 0; j < colCnt; ++j) {
+                const QPersistentModelIndex currIdx = q->sourceModel()->index(i, j);
+                m_mapping.insert(currIdx, currItm);
+                currItm->columns().append(currIdx);
+                if (q->sourceModel()->hasChildren(currIdx))
+                    rebuildTreeStructure(currIdx, currItm, j);
+            }
+            Q_ASSERT(currItm->columns().size() == colCnt);
         }
-        else {
-            catParent = m_treeStructure.at(mappingIndex);
-        }
-        TreeRow* const currItm = new TreeRow(catParent, 0);
-        for (int j = 0; j < colCnt; ++j) {
-            const QPersistentModelIndex currIdx = q->sourceModel()->index(i, j);
-            m_mapping.insert(currIdx, currItm);
-            currItm->columns().append(currIdx);
-            if (q->sourceModel()->hasChildren(currIdx))
-                rebuildTreeStructure(currIdx, currItm, j);
-        }
-        Q_ASSERT(currItm->columns().size() == colCnt);
     }
     q->endResetModel();
 }
@@ -392,15 +405,21 @@ void CategorizerPrivate::onSourceColumnsInserted(const QModelIndex &parent, int 
         q->endInsertColumns();
     }
     else {
-        // #TODO
         const int catSize = m_treeStructure.size();
         q->endInsertColumns(); // started in onSourceColumnsAboutToBeInserted
         // insert within categories
         for (int catIter = 0; catIter < catSize; ++catIter) {
             const QModelIndex catParent = q->index(catIter, 0);
+            Q_ASSERT(m_treeStructure.at(catIter)->columns().isEmpty());
             q->beginInsertColumns(catParent, first, last);
-            for (int j = first; j <= last; ++j) {
-                m_treeStructure.at(catIter)->columns().insert(j, q->sourceModel()->index(catIter, j, parent));
+            const int childSize = m_treeStructure.at(catIter)->children().size();
+            for (int childIter = 0; childIter < childSize; ++childIter) {
+                QList<QPersistentModelIndex>& currColumns = m_treeStructure.at(catIter)->children().at(childIter)->columns();
+                Q_ASSERT(!currColumns.isEmpty());
+                const int currRow = currColumns.first().row();
+                for (int j = first; j <= last; ++j) {
+                    currColumns.insert(j, q->sourceModel()->index(currRow, j, parent));
+                }
             }
             q->endInsertColumns();
         }
@@ -527,24 +546,30 @@ void Categorizer::setSourceModel(QAbstractItemModel* newSourceModel)
 {
     Q_D(Categorizer);
     if (sourceModel()) {
-        for (auto discIter = d->m_sourceConnections.cbegin(); discIter != d->m_sourceConnections.cend(); ++discIter)
+        const auto connEnd = d->m_sourceConnections.cend();
+        for (auto discIter = d->m_sourceConnections.cbegin(); discIter != connEnd; ++discIter)
             QObject::disconnect(*discIter);
     }
     d->m_sourceConnections.clear();
     QAbstractProxyModel::setSourceModel(newSourceModel);
     d->rebuildMapping();
     if (sourceModel()) {
-        d->m_sourceConnections << QObject::connect(sourceModel(), &QAbstractItemModel::modelAboutToBeReset, this, &QAbstractItemModel::modelAboutToBeReset);
-        d->m_sourceConnections << QObject::connect(sourceModel(), &QAbstractItemModel::modelReset, this, std::bind(&CategorizerPrivate::rebuildMapping, d));
-        d->m_sourceConnections << QObject::connect(sourceModel(), &QAbstractItemModel::dataChanged, this, std::bind(&CategorizerPrivate::onSourceDataChanged, d, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
-        d->m_sourceConnections << QObject::connect(sourceModel(), &QAbstractItemModel::rowsInserted, this, std::bind(&CategorizerPrivate::onSourceRowsInserted, d, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
-        d->m_sourceConnections << QObject::connect(sourceModel(), &QAbstractItemModel::columnsInserted, this, std::bind(&CategorizerPrivate::onSourceColumnsInserted, d, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
-        d->m_sourceConnections << QObject::connect(sourceModel(), &QAbstractItemModel::columnsAboutToBeInserted, this, std::bind(&CategorizerPrivate::onSourceColumnsAboutToBeInserted, d, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
-        d->m_sourceConnections << QObject::connect(sourceModel(), &QAbstractItemModel::dataChanged, this, [this](const QModelIndex& topLeft, const QModelIndex& bottomRight, const QVector<int>& roles) {
-            dataChanged(mapFromSource(topLeft), mapFromSource(bottomRight), roles);
-        });
-        d->m_sourceConnections << QObject::connect(sourceModel(), &QAbstractItemModel::headerDataChanged, this, &QAbstractItemModel::headerDataChanged);
+        d->m_sourceConnections
+            << connect(sourceModel(), &QAbstractItemModel::modelAboutToBeReset, this, &QAbstractItemModel::modelAboutToBeReset)
+            << connect(sourceModel(), &QAbstractItemModel::modelReset, this, std::bind(&CategorizerPrivate::rebuildMapping, d))
+            << connect(sourceModel(), &QAbstractItemModel::dataChanged, this, std::bind(&CategorizerPrivate::onSourceDataChanged, d, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3))
+            << connect(sourceModel(), &QAbstractItemModel::rowsInserted, this, std::bind(&CategorizerPrivate::onSourceRowsInserted, d, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3))
+            << connect(sourceModel(), &QAbstractItemModel::columnsInserted, this, std::bind(&CategorizerPrivate::onSourceColumnsInserted, d, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3))
+            << connect(sourceModel(), &QAbstractItemModel::columnsAboutToBeInserted, this, std::bind(&CategorizerPrivate::onSourceColumnsAboutToBeInserted, d, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3))
+            << connect(sourceModel(), &QAbstractItemModel::rowsRemoved, this, std::bind(&CategorizerPrivate::onSourceRowsRemoved, d, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3))
+            << connect(sourceModel(), &QAbstractItemModel::rowsAboutToBeRemoved, this, std::bind(&CategorizerPrivate::onSourceRowsAboutToBeRemoved, d, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3))
+            << connect(sourceModel(), &QAbstractItemModel::dataChanged, this, [this](const QModelIndex& topLeft, const QModelIndex& bottomRight, const QVector<int>& roles) {
+                dataChanged(mapFromSource(topLeft), mapFromSource(bottomRight), roles);
+            })
+            << connect(sourceModel(), &QAbstractItemModel::headerDataChanged, this, &QAbstractItemModel::headerDataChanged)
+            ;
     }
+    Q_ASSERT(std::all_of(d->m_sourceConnections.cbegin(), d->m_sourceConnections.cend(), [](const QMetaObject::Connection &connection)->bool {return connection; }));
 }
 
 QModelIndex Categorizer::buddy(const QModelIndex &index) const 

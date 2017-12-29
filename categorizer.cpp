@@ -255,6 +255,7 @@ TreeRow* CategorizerPrivate::itemForIndex(const QModelIndex& idx) const
 {
     if (!idx.isValid())
         return Q_NULLPTR;
+    Q_ASSERT(idx.model() == q_ptr);
     const TreeRow* const internalParent = static_cast<const TreeRow*>(idx.internalPointer());
     if (internalParent)
         return internalParent->children().value(idx.row(), Q_NULLPTR);
@@ -383,11 +384,94 @@ void CategorizerPrivate::onSourceRowsInserted(const QModelIndex &parent, int fir
         q->endInsertRows();
     }
 }
-void CategorizerPrivate::onSourceColumnsAboutToBeInserted(const QModelIndex &parent, int first, int last){
+
+
+void CategorizerPrivate::onSourceRowsAboutToBeRemoved(const QModelIndex &parent, int first, int last)
+{
     Q_Q(Categorizer);
-    if(!parent.isValid())
-        q->beginInsertColumns(QModelIndex(), first, last);
+    if(parent.isValid()){
+        Q_ASSERT(parent.model() == q->sourceModel());
+        q->beginRemoveRows(q->mapFromSource(parent), first, last);
+        return;
+    }
+    // Since root items for the source model can have different parents in the proxy,
+    // the removal for the proxy needs to be done here
+    QList<int> catToRemove;
+    const int catSize = m_treeStructure.size();
+    for (int catIter = 0; catIter < catSize; ++catIter){ 
+        const int childSize = m_treeStructure.at(catIter)->children().size();
+        QList<int> childrenToRemove;
+        for (int childIter = 0; childIter < childSize; ++childIter){
+            const QList<QPersistentModelIndex>& childCols = m_treeStructure.at(catIter)->children().at(childIter)->columns();
+            Q_ASSERT(!childCols.isEmpty());
+            const int childRow = childCols.first().row();
+            if (childRow >= first && childRow <= last)
+                childrenToRemove << childIter;
+        }
+        if (childrenToRemove.size() == childSize){ //remove entire category
+            catToRemove << catIter;
+        }
+        else{
+            Q_ASSERT(std::is_sorted(childrenToRemove.cbegin(), childrenToRemove.cend()));
+            while (!childrenToRemove.isEmpty()) {
+                int childLast = childrenToRemove.takeLast();
+                int childFirst = childLast;
+                while (!childrenToRemove.isEmpty() && childFirst - childrenToRemove.last() == 1)
+                    childFirst = childrenToRemove.takeLast();
+                q->beginRemoveRows(q->index(catIter, 0), childFirst, childLast);
+                for (; childFirst <= childLast; --childLast) {
+                    TreeRow* itemToRemove = m_treeStructure.at(catIter)->children().takeAt(childLast);
+                    removeFromMapping(itemToRemove);
+                    delete itemToRemove;
+                }
+                q->endRemoveRows();
+            }
+        }
+    }
+    Q_ASSERT(std::is_sorted(catToRemove.cbegin(), catToRemove.cend()));
+    while (!catToRemove.isEmpty()){
+        int catLast = catToRemove.takeLast();
+        int catFirst = catLast;
+        while (!catToRemove.isEmpty() && catFirst - catToRemove.last() == 1)
+            catFirst = catToRemove.takeLast();
+        q->beginRemoveRows(QModelIndex(), catFirst, catLast);
+        for (; catFirst <= catLast; --catLast){
+            TreeRow* itemToRemove = m_treeStructure.takeAt(catLast);
+            removeFromMapping(itemToRemove);
+            delete itemToRemove;
+        }
+        q->endRemoveRows();
+    }
 }
+
+void CategorizerPrivate::onSourceRowsRemoved(const QModelIndex &parent, int first, int last)
+{
+    Q_Q(Categorizer);
+    if (parent.isValid()) {
+        Q_ASSERT(parent.model() == q->sourceModel());
+        TreeRow* parentItem = itemForIndex(q->mapFromSource(parent));
+        for (; first <= last; --last) {
+            TreeRow* itemToRemove = parentItem->children().takeAt(last);
+            removeFromMapping(itemToRemove);
+            delete itemToRemove;
+        }
+        q->endRemoveRows(); //started in onSourceRowsAboutToBeRemoved
+        return;
+    }
+}
+
+void CategorizerPrivate::onSourceColumnsAboutToBeInserted(const QModelIndex &parent, int first, int last)
+{
+    Q_Q(Categorizer);
+    if (parent.isValid()){
+        const QModelIndex proxyParent = q->mapFromSource(parent);
+        q->beginInsertColumns(proxyParent, first, last);
+    }
+    else {
+        q->beginInsertColumns(QModelIndex(), first, last);
+    }
+}
+
 void CategorizerPrivate::onSourceColumnsInserted(const QModelIndex &parent, int first, int last)
 {
     Q_Q(Categorizer);
@@ -396,13 +480,12 @@ void CategorizerPrivate::onSourceColumnsInserted(const QModelIndex &parent, int 
         TreeRow* const parentItem = itemForIndex(proxyParent);
         Q_ASSERT(parentItem);
         const int childSize = parentItem->children().size();
-        q->beginInsertColumns(proxyParent, first, last);
         for (int i = 0; i < childSize; ++i) {
             for (int j = first; j <= last;++j){
                 parentItem->children().at(i)->columns().insert(j, q->sourceModel()->index(i, j, parent));
             }
         }
-        q->endInsertColumns();
+        q->endInsertColumns(); // started in onSourceColumnsAboutToBeInserted
     }
     else {
         const int catSize = m_treeStructure.size();
